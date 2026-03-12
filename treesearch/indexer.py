@@ -7,7 +7,6 @@ Supports batch indexing via ``build_index()`` which accepts glob patterns and
 processes multiple files concurrently.
 """
 import asyncio
-import glob as globmod
 import json
 import logging
 import os
@@ -17,6 +16,7 @@ from typing import Optional
 from .tree import (
     Document, assign_node_ids, flatten_tree, format_structure, remove_fields,
 )
+from .pathutil import resolve_paths, DEFAULT_IGNORE_DIRS, MAX_DIR_FILES
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 def _children_indices(node_list: list[dict], parent_idx: int, parent_level: int) -> list[int]:
-    """Return indices of immediate children of node_list[parent_idx]."""
+    """Return indices of all descendants of node_list[parent_idx]."""
     indices = []
     for j in range(parent_idx + 1, len(node_list)):
         if node_list[j]["level"] <= parent_level:
@@ -54,7 +54,7 @@ def _summarize_node(node: dict, threshold: int = 200) -> str:
     return f"{head} ... {tail}"
 
 
-async def generate_summaries(structure, threshold: int = 200):
+def generate_summaries(structure, threshold: int = 200):
     """Generate summaries for all nodes in a tree."""
     nodes = flatten_tree(structure)
     summaries = [_summarize_node(n, threshold=threshold) for n in nodes]
@@ -84,7 +84,7 @@ def generate_doc_description(structure) -> str:
     return f"{title_str}. {text}" if text else title_str
 
 
-async def _finalize_tree(
+def _finalize_tree(
     tree,
     doc_name: str,
     source_path: str = "",
@@ -112,7 +112,7 @@ async def _finalize_tree(
 
     if if_add_node_summary:
         logger.info("Generating summaries...")
-        tree = await generate_summaries(tree, threshold=summary_token_threshold)
+        tree = generate_summaries(tree, threshold=summary_token_threshold)
         if not if_add_node_text:
             order_no_text = [f for f in order if f != "text"]
             tree = format_structure(tree, order=order_no_text)
@@ -289,7 +289,7 @@ async def md_to_tree(
     logger.info("Building tree from %d nodes...", len(nodes))
     tree = _build_tree(nodes)
 
-    return await _finalize_tree(
+    return _finalize_tree(
         tree, doc_name,
         source_path=os.path.abspath(md_path) if md_path else "",
         if_add_node_id=if_add_node_id,
@@ -410,22 +410,6 @@ def _preprocess_text(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text)
 
 
-def _cut_text_content(markers: list[dict], lines: list[str]) -> list[dict]:
-    """Cut text between headings for plain text."""
-    nodes = []
-    for i, mk in enumerate(markers):
-        start = mk["line_num"] - 1
-        end = markers[i + 1]["line_num"] - 1 if i + 1 < len(markers) else len(lines)
-        nodes.append({
-            "title": mk["title"],
-            "line_num": mk["line_num"],
-            "line_start": mk["line_num"],
-            "line_end": end,
-            "level": mk["level"],
-            "text": "\n".join(lines[start:end]).strip(),
-        })
-    return nodes
-
 
 async def text_to_tree(
     text_path: Optional[str] = None,
@@ -476,7 +460,7 @@ async def text_to_tree(
         markers = [{"title": doc_name, "line_num": 1, "level": 1}]
 
     # Step 2: extract text
-    nodes = _cut_text_content(markers, lines)
+    nodes = _cut_md_text(markers, lines)
 
     # Step 3: thinning
     if if_thinning and min_token_threshold:
@@ -488,7 +472,7 @@ async def text_to_tree(
     logger.info("Building tree from %d nodes...", len(nodes))
     tree = _build_tree(nodes)
 
-    return await _finalize_tree(
+    return _finalize_tree(
         tree, doc_name,
         source_path=os.path.abspath(text_path) if text_path else "",
         if_add_node_id=if_add_node_id,
@@ -603,7 +587,7 @@ async def code_to_tree(
     if not markers:
         markers = [{"title": doc_name, "line_num": 1, "level": 1}]
 
-    nodes = _cut_text_content(markers, lines)
+    nodes = _cut_md_text(markers, lines)
 
     if if_thinning and min_token_threshold:
         nodes = _update_token_counts(nodes)
@@ -613,7 +597,7 @@ async def code_to_tree(
     logger.info("Building tree from %d nodes...", len(nodes))
     tree = _build_tree(nodes)
 
-    return await _finalize_tree(
+    return _finalize_tree(
         tree, doc_name,
         source_path=os.path.abspath(code_path),
         if_add_node_id=if_add_node_id,
@@ -677,7 +661,7 @@ async def json_to_tree(
 
     tree = _build_tree(flat_nodes)
 
-    return await _finalize_tree(
+    return _finalize_tree(
         tree, doc_name,
         source_path=os.path.abspath(json_path),
         if_add_node_id=if_add_node_id,
@@ -723,7 +707,7 @@ async def csv_to_tree(
 
     tree = _build_tree(flat_nodes)
 
-    return await _finalize_tree(
+    return _finalize_tree(
         tree, doc_name,
         source_path=os.path.abspath(csv_path),
         if_add_node_id=if_add_node_id,
@@ -765,6 +749,9 @@ async def build_index(
     if_add_node_id: Optional[bool] = None,
     max_concurrency: Optional[int] = None,
     force: bool = False,
+    ignore_dirs: frozenset[str] = DEFAULT_IGNORE_DIRS,
+    respect_gitignore: bool = True,
+    max_files: int = MAX_DIR_FILES,
     **kwargs,
 ) -> list[Document]:
     """
@@ -773,11 +760,15 @@ async def build_index(
     All parameters default to ``get_config()`` values when not explicitly set.
 
     Args:
-        paths: list of file paths or glob patterns (e.g. ["docs/*.md", "paper.txt"])
+        paths: list of file paths, glob patterns, or directories
+            (e.g. ``["docs/*.md", "paper.txt", "src/"]``)
         output_dir: directory for the database file (used to derive db_path if db_path is empty)
         db_path: path to the SQLite database file. If empty, defaults to ``{output_dir}/index.db``.
         max_concurrency: max concurrent indexing tasks
         force: force re-index even if file unchanged (default: False)
+        ignore_dirs: directory names to skip during recursive walk
+        respect_gitignore: honour ``.gitignore`` files when walking directories
+        max_files: safety cap on files discovered per directory walk
         **kwargs: passed through to individual parsers
 
     Returns:
@@ -804,18 +795,13 @@ async def build_index(
         db_path = os.path.join(output_dir, "index.db")
     os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
 
-    # Expand globs
-    expanded = []
-    for p in paths:
-        matches = sorted(globmod.glob(p))
-        if matches:
-            expanded.extend(matches)
-        elif os.path.isfile(p):
-            expanded.append(p)
-        else:
-            logger.warning("No files matched: %s", p)
-    expanded = list(dict.fromkeys(expanded))  # deduplicate, preserve order
-
+    # Expand globs, files, and directories via resolve_paths
+    expanded = resolve_paths(
+        paths,
+        ignore_dirs=ignore_dirs,
+        respect_gitignore=respect_gitignore,
+        max_files=max_files,
+    )
     if not expanded:
         raise FileNotFoundError(f"No files found for patterns: {paths}")
 
